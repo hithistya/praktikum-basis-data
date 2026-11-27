@@ -1,0 +1,19 @@
+HGETALL laporan:7
+HMGET hasil_deteksi:7 jenis_kerusakan tingkat_keyakinan
+ZRANGEBYSCORE idx:status:menunggu:laporan 1793491200 +inf
+HMGET laporan:2 alamat waktu_lapor
+HMGET hasil_deteksi:2 jenis_kerusakan tingkat_keyakinan
+HGETALL stats:status
+ZCARD idx:status:selesai:laporan
+ZREVRANGE idx:prioritas:laporan 0 4 WITHSCORES
+LRANGE riwayat:laporan:3 0 -1
+HGETALL riwayat:4
+HGETALL riwayat:5
+HGETALL riwayat:6
+GEOSEARCH idx:lokasi:laporan FROMLONLAT 112.4400000 -7.4700000 BYRADIUS 100 m ASC WITHDIST
+SET session:tok_abc123 "{\"id_pengguna\":4,\"role\":\"Petugas\"}" EX 1800
+GET session:tok_abc123
+TTL session:tok_abc123
+EXPIRE session:tok_abc123 1800
+DEL session:tok_abc123
+GET session:tok_abc123
