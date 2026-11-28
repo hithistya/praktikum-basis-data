@@ -1,69 +1,93 @@
-"""Tahap 3 - Loading: masukkan payload hasil transformasi ke Redis.
-Pemakaian: python migration/loading/load_to_redis.py [--flush]
---flush menghapus key milik aplikasi (laporan:*, hasil_deteksi:*, pengguna:*, riwayat:*, idx:*, stats:*, seq:*)
-sebelum memuat, sehingga aman dijalankan ulang. Key session:* tidak disentuh."""
-import json
+"""Tahap 3 - Loading: ekstraksi -> transformasi -> tulis ke Redis.
+
+Contoh:
+  python migration/loading/load_to_redis.py                      # MySQL -> Redis
+  python migration/loading/load_to_redis.py --source dump        # dari file .sql
+  python migration/loading/load_to_redis.py --source dump --dry-run   # hanya cetak perintah
+"""
+import argparse
+import os
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from keys import (KEY_GEO, KEY_PRIORITAS, KEY_SEQ_RIWAYAT, KEY_STATS, NAMESPACE_PATTERNS,  # noqa: E402
-                  OUT_DIR, key_deteksi, key_laporan, key_pengguna, key_riwayat, key_riwayat_list,
-                  key_status_idx, redis_client)
+ROOT = Path(__file__).resolve().parents[2]
+sys.path[:0] = [str(ROOT / "migration" / "extraction"), str(ROOT / "migration" / "transformation")]
+
+from extract import extract_from_dump, extract_from_mysql  
+from transform import build_commands, ringkasan  
+
+DEFAULT_DUMP = ROOT / "mysql" / "source-schema-and-data" / "db_laporan_kerusakan_jalan.sql"
+MANAGED = ["laporan:*", "hasil_deteksi:*", "pengguna:*", "riwayat:*", "idx:*", "stats:status", "seq:riwayat"]
 
 
-def load(r, p: dict, flush: bool = False) -> dict:
-    if flush:
-        for pattern in NAMESPACE_PATTERNS:
-            keys = list(r.scan_iter(match=pattern, count=500))
-            if keys:
-                r.delete(*keys)
-    pipe = r.pipeline(transaction=False)
+def quote(a):
+    return f'"{a}"' if (" " in a or not a) else a
 
-    def put_hash(key, fields):
-        pipe.delete(key)
-        pipe.hset(key, mapping=fields)
 
-    for x in p["laporan"]: put_hash(key_laporan(x["id"]), x["fields"])
-    for x in p["hasil_deteksi"]: put_hash(key_deteksi(x["id"]), x["fields"])
-    for x in p["pengguna"]: put_hash(key_pengguna(x["id"]), x["fields"])
-    for x in p["riwayat"]: put_hash(key_riwayat(x["id"]), x["fields"])
-    for lid, ids in p["riwayat_list"].items():
-        pipe.delete(key_riwayat_list(lid))
-        pipe.rpush(key_riwayat_list(lid), *ids)
-    for status, members in p["status_index"].items():
-        pipe.delete(key_status_idx(status))
-        if members:
-            pipe.zadd(key_status_idx(status), members)
-    put_hash(KEY_STATS, p["stats"])
-    pipe.delete(KEY_PRIORITAS)
-    if p["prioritas"]:
-        pipe.zadd(KEY_PRIORITAS, p["prioritas"])
-    pipe.delete(KEY_GEO)
-    for g in p["geo"]:
-        pipe.geoadd(KEY_GEO, (g["lng"], g["lat"], str(g["id"])))
-    pipe.set(KEY_SEQ_RIWAYAT, p["seq_riwayat"])
-    pipe.execute()
-    return {
-        "laporan": len(p["laporan"]), "hasil_deteksi": len(p["hasil_deteksi"]),
-        "pengguna": len(p["pengguna"]), "riwayat": len(p["riwayat"]),
-        "prioritas": r.zcard(KEY_PRIORITAS), "geo": r.zcard(KEY_GEO),
+def verify(r, exp):
+    def n(pattern, skip=None):
+        return sum(1 for k in r.scan_iter(match=pattern) if not (skip and k.startswith(skip)))
+
+    status_total = sum(r.zcard(k) for k in r.scan_iter(match="idx:status:*"))
+    got = {
+        "hash laporan": n("laporan:*"),
+        "hash hasil_deteksi": n("hasil_deteksi:*"),
+        "hash pengguna": n("pengguna:*"),
+        "hash riwayat": n("riwayat:*", skip="riwayat:laporan:"),
+        "list riwayat:laporan": n("riwayat:laporan:*"),
+        "anggota zset status": status_total,
+        "anggota zset prioritas": r.zcard("idx:prioritas:laporan"),
+        "anggota geo lokasi": r.zcard("idx:lokasi:laporan"),
+        "seq:riwayat": int(r.get("seq:riwayat") or 0),
     }
+    ok = True
+    print(f"\n{'Pemeriksaan':28}{'Diharapkan':>12}{'Di Redis':>10}")
+    for k, v in exp.items():
+        flag = "" if got[k] == v else "  <-- BEDA"
+        ok &= got[k] == v
+        print(f"{k:28}{v:>12}{got[k]:>10}{flag}")
+    return ok
 
 
 def main():
-    p = json.loads((OUT_DIR / "redis_payload.json").read_text(encoding="utf-8"))
-    r = redis_client()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--source", choices=["mysql", "dump"], default="mysql")
+    ap.add_argument("--dump", default=str(DEFAULT_DUMP))
+    ap.add_argument("--dry-run", action="store_true", help="cetak perintah, tidak menulis ke Redis")
+    ap.add_argument("--no-reset", action="store_true", help="jangan hapus key migrasi lama dulu")
+    a = ap.parse_args()
+
+    data = extract_from_dump(a.dump) if a.source == "dump" else extract_from_mysql()
+    cmds = build_commands(data)
+    exp = ringkasan(cmds)
+    print(f"Ekstraksi: {len(data['laporan'])} laporan, {len(data['hasil_deteksi'])} hasil_deteksi (terbaru), "
+          f"{len(data['pengguna'])} pengguna, {len(data['riwayat_status'])} riwayat")
+
+    if a.dry_run:
+        for c in cmds:
+            print(" ".join(quote(x) for x in c))
+        print("\nRingkasan yang akan dibuat:")
+        for k, v in exp.items():
+            print(f"  {k:28}{v}")
+        return 0
+
+    import redis  # pip install redis
+
+    r = redis.Redis(host=os.getenv("REDIS_HOST", "localhost"), port=int(os.getenv("REDIS_PORT", "6379")),
+                    db=int(os.getenv("REDIS_DB", "0")), password=os.getenv("REDIS_PASSWORD") or None,
+                    decode_responses=True)
     r.ping()
-    res = load(r, p, flush="--flush" in sys.argv)
-    print(f"[load] HASH laporan:*         : {res['laporan']}")
-    print(f"[load] HASH hasil_deteksi:*   : {res['hasil_deteksi']}")
-    print(f"[load] HASH pengguna:*        : {res['pengguna']}")
-    print(f"[load] HASH riwayat:*         : {res['riwayat']}")
-    print(f"[load] ZSET idx:prioritas     : {res['prioritas']}")
-    print(f"[load] GEO  idx:lokasi        : {res['geo']}")
-    print(f"[load] stats:status           : {r.hgetall(KEY_STATS)}")
+    if not a.no_reset:
+        for p in MANAGED:
+            for k in r.scan_iter(match=p):
+                r.delete(k)
+    pipe = r.pipeline(transaction=False)
+    for c in cmds:
+        pipe.execute_command(*c)
+    pipe.execute()
+    print(f"Memuat {len(cmds)} perintah ke Redis selesai.")
+    return 0 if verify(r, exp) else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

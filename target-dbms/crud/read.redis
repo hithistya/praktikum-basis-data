@@ -1,0 +1,7 @@
+# READ
+HGETALL laporan:100
+
+HMGET hasil_deteksi:100 jenis_kerusakan tingkat_keyakinan
+
+LRANGE riwayat:laporan:100 0 -1
+

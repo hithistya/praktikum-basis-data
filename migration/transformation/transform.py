@@ -1,153 +1,109 @@
-"""Tahap 2 - Transformasi: ubah baris relasional menjadi struktur Redis.
-Menghasilkan redis_payload.json (untuk load_to_redis.py) dan migrasi_data.redis"""
-import calendar
+"""Tahap 2 - Transformasi: data relasional (MySQL) -> perintah Redis.
+
+Aturan mengikuti tabel pemetaan (Bagian C laporan). Fungsi build_commands()
+murni (tanpa koneksi), hasilnya daftar tuple perintah Redis, mis.
+("HSET", "laporan:1", "id_laporan", "1", ...).
+"""
 import json
-import sys
-from datetime import datetime
-from pathlib import Path
+from datetime import datetime, timezone
+from decimal import Decimal
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from keys import (BOBOT_KEPARAHAN, KEY_GEO, KEY_PRIORITAS, KEY_SEQ_RIWAYAT, KEY_STATS,  # noqa: E402
-                  OUT_DIR, STATUSES, key_deteksi, key_laporan, key_pengguna, key_riwayat,
-                  key_riwayat_list, key_status_idx)
-
-
-def _dt(v):
-    return datetime.fromisoformat(str(v).replace("T", " "))
-
-
-def _fmt(v):
-    return _dt(v).strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _unix(v):
-    """Unix timestamp (detik). waktu_lapor diperlakukan sebagai UTC, sama seperti Modul 12."""
-    return calendar.timegm(_dt(v).timetuple())
+LAPORAN_FIELDS = [  
+    "id_laporan", "id_pengguna", "tingkat_keparahan", "foto",
+    "latitude", "longitude", "alamat", "waktu_lapor", "status",
+]
+DETEKSI_FIELDS = [
+    "id_deteksi", "id_laporan", "jenis_kerusakan", "kotak_batas",
+    "tingkat_keyakinan", "detail_deteksi",
+]
+PENGGUNA_FIELDS = ["id_pengguna", "id_role", "nama_role", "nama"]  
+RIWAYAT_FIELDS = [
+    "id_riwayat", "id_laporan", "id_pengguna",
+    "waktu_perubahan", "status_baru", "catatan",
+]
+BOBOT = {"rendah": 1, "sedang": 2, "tinggi": 3}
 
 
-def _json(v):
-    """Kolom JSON MySQL -> string JSON ringkas; NULL -> string kosong (Redis tidak punya NULL)."""
+def s(v):
+    """Semua nilai disimpan sebagai string; NULL menjadi string kosong."""
     if v is None:
         return ""
-    obj = json.loads(v) if isinstance(v, str) else v
-    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+    if isinstance(v, datetime):
+        return v.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(v, (dict, list)):
+        return json.dumps(v, separators=(", ", ": "))
+    return str(v)
 
 
-def laporan_fields(r):
+def unix_utc(v):
+    dt = v if isinstance(v, datetime) else datetime.strptime(s(v), "%Y-%m-%d %H:%M:%S")
+    return int(dt.replace(tzinfo=timezone.utc).timestamp())
+
+
+def hset(key, row, fields):
+    args = []
+    for f in fields:
+        args += [f, s(row.get(f))]
+    return ("HSET", key, *args)
+
+
+def skor_prioritas(tingkat, keyakinan):
+    d = Decimal(s(keyakinan)) * BOBOT[s(tingkat).lower()]
+    return format(d.normalize(), "f")
+
+
+def build_commands(data):
+    cmds = []
+    for r in data["laporan"]:
+        cmds.append(hset(f"laporan:{r['id_laporan']}", r, LAPORAN_FIELDS))
+    for r in data["hasil_deteksi"]:
+        cmds.append(hset(f"hasil_deteksi:{r['id_laporan']}", r, DETEKSI_FIELDS))
+    for r in data["pengguna"]:
+        cmds.append(hset(f"pengguna:{r['id_pengguna']}", r, PENGGUNA_FIELDS))
+
+    # indeks status + counter
+    counter = {}
+    for r in data["laporan"]:
+        st = s(r["status"]).lower()
+        counter[st] = counter.get(st, 0) + 1
+        cmds.append(("ZADD", f"idx:status:{st}:laporan", str(unix_utc(r["waktu_lapor"])), s(r["id_laporan"])))
+    for st, n in counter.items():
+        cmds.append(("HSET", "stats:status", st, str(n)))
+
+    # antrean prioritas: belum Selesai DAN sudah punya deteksi
+    deteksi = {d["id_laporan"]: d for d in data["hasil_deteksi"]}
+    for r in data["laporan"]:
+        d = deteksi.get(r["id_laporan"])
+        if d and s(r["status"]).lower() != "selesai":
+            cmds.append(("ZADD", "idx:prioritas:laporan",
+                         skor_prioritas(r["tingkat_keparahan"], d["tingkat_keyakinan"]),
+                         s(r["id_laporan"])))
+
+    # indeks lokasi (GEOADD: longitude dulu, lalu latitude)
+    for r in data["laporan"]:
+        cmds.append(("GEOADD", "idx:lokasi:laporan", s(r["longitude"]), s(r["latitude"]), s(r["id_laporan"])))
+
+    # riwayat (data sudah terurut menurut waktu_perubahan)
+    max_id = 0
+    for r in data["riwayat_status"]:
+        cmds.append(hset(f"riwayat:{r['id_riwayat']}", r, RIWAYAT_FIELDS))
+        cmds.append(("RPUSH", f"riwayat:laporan:{r['id_laporan']}", s(r["id_riwayat"])))
+        max_id = max(max_id, int(r["id_riwayat"]))
+    cmds.append(("SET", "seq:riwayat", str(max_id)))
+    return cmds
+
+
+def ringkasan(cmds):
+    """Jumlah objek yang akan dibuat; dipakai untuk dry-run dan validasi."""
+    hset_keys = [c[1] for c in cmds if c[0] == "HSET"]
     return {
-        "id_laporan": str(r["id_laporan"]), "id_pengguna": str(r["id_pengguna"]),
-        "alamat": r["alamat"] or "", "status": r["status"] or "",
-        "waktu_lapor": _fmt(r["waktu_lapor"]), "tingkat_keparahan": r["tingkat_keparahan"] or "",
-        "foto": r["foto"] or "",
-        "latitude": f"{float(r['latitude']):.7f}", "longitude": f"{float(r['longitude']):.7f}",
+        "hash laporan": sum(k.startswith("laporan:") for k in hset_keys),
+        "hash hasil_deteksi": sum(k.startswith("hasil_deteksi:") for k in hset_keys),
+        "hash pengguna": sum(k.startswith("pengguna:") for k in hset_keys),
+        "hash riwayat": sum(k.startswith("riwayat:") for k in hset_keys),
+        "list riwayat:laporan": len({c[1] for c in cmds if c[0] == "RPUSH"}),
+        "anggota zset status": sum(c[0] == "ZADD" and c[1].startswith("idx:status:") for c in cmds),
+        "anggota zset prioritas": sum(c[0] == "ZADD" and c[1] == "idx:prioritas:laporan" for c in cmds),
+        "anggota geo lokasi": sum(c[0] == "GEOADD" for c in cmds),
+        "seq:riwayat": int(next(c[2] for c in cmds if c[0] == "SET")),
     }
-
-
-def deteksi_fields(d):
-    return {
-        "id_deteksi": str(d["id_deteksi"]), "jenis_kerusakan": d["jenis_kerusakan"] or "",
-        "tingkat_keyakinan": f"{float(d['tingkat_keyakinan']):.2f}",
-        "kotak_batas": _json(d["kotak_batas"]), "detail_deteksi": _json(d["detail_deteksi"]),
-    }
-
-
-def priority_score(lap, det):
-    """Skor = bobot keparahan x tingkat keyakinan (0-100). Hanya laporan belum selesai yang sudah punya deteksi."""
-    if det is None or (lap["status"] or "").lower() == "selesai":
-        return None
-    w = BOBOT_KEPARAHAN.get((lap["tingkat_keparahan"] or "").lower(), 1)
-    return round(w * float(det["tingkat_keyakinan"]), 2)
-
-
-def build_payload(ex: dict) -> dict:
-    det_by = {d["id_laporan"]: d for d in ex["hasil_deteksi"]}
-    laporan, deteksi, status_index, prioritas, geo, skipped = [], [], {s: {} for s in STATUSES}, {}, [], []
-    for r in ex["laporan"]:
-        i = r["id_laporan"]
-        if r["latitude"] is None or r["longitude"] is None or r["waktu_lapor"] is None:
-            skipped.append({"id_laporan": i, "alasan": "koordinat/waktu kosong"})
-            continue
-        laporan.append({"id": i, "fields": laporan_fields(r)})
-        status_index.setdefault((r["status"] or "").lower(), {})[str(i)] = _unix(r["waktu_lapor"])
-        det = det_by.get(i)
-        if det:
-            deteksi.append({"id": i, "fields": deteksi_fields(det)})
-        sc = priority_score(r, det)
-        if sc is not None:
-            prioritas[str(i)] = sc
-        geo.append({"id": i, "lng": float(r["longitude"]), "lat": float(r["latitude"])})
-    riwayat = [{"id": h["id_riwayat"], "fields": {
-        "id_riwayat": str(h["id_riwayat"]), "id_laporan": str(h["id_laporan"]),
-        "id_pengguna": str(h["id_pengguna"]), "waktu_perubahan": _fmt(h["waktu_perubahan"]),
-        "status_baru": h["status_baru"] or "", "catatan": h["catatan"] or ""}} for h in ex["riwayat_status"]]
-    riwayat_list = {}
-    for h in ex["riwayat_status"]:
-        riwayat_list.setdefault(str(h["id_laporan"]), []).append(h["id_riwayat"])
-    pengguna = [{"id": p["id_pengguna"], "fields": {
-        "id_pengguna": str(p["id_pengguna"]), "nama": p["nama"], "id_role": str(p["id_role"]),
-        "nama_role": p["nama_role"]}} for p in ex["pengguna"]]
-    stats = {s: len(status_index.get(s, {})) for s in STATUSES}
-    for s, m in status_index.items():
-        stats.setdefault(s, len(m))
-    return {
-        "laporan": laporan, "hasil_deteksi": deteksi, "pengguna": pengguna, "riwayat": riwayat,
-        "riwayat_list": riwayat_list, "status_index": status_index, "stats": stats,
-        "prioritas": prioritas, "geo": geo,
-        "seq_riwayat": max([h["id_riwayat"] for h in ex["riwayat_status"]] or [0]),
-        "summary": {
-            "laporan": len(laporan), "hasil_deteksi": len(deteksi), "pengguna": len(pengguna),
-            "riwayat": len(riwayat), "riwayat_list": len(riwayat_list), "prioritas": len(prioritas),
-            "geo": len(geo), "skipped": skipped,
-            "tanpa_deteksi": [r["id"] for r in laporan if r["id"] not in det_by],
-        },
-    }
-
-
-def _q(v):
-    return '"' + str(v).replace("\\", "\\\\").replace('"', '\\"') + '"'
-
-
-def to_redis_commands(p: dict) -> list:
-    """Perintah Redis setara dengan load_to_redis.py (untuk redis-cli / Redis Insight)."""
-    c = []
-    def hset(key, f):
-        c.append(f"HSET {key} " + " ".join(f"{k} {_q(v)}" for k, v in f.items()))
-    for x in p["laporan"]: hset(key_laporan(x["id"]), x["fields"])
-    for x in p["hasil_deteksi"]: hset(key_deteksi(x["id"]), x["fields"])
-    for x in p["pengguna"]: hset(key_pengguna(x["id"]), x["fields"])
-    for x in p["riwayat"]: hset(key_riwayat(x["id"]), x["fields"])
-    for lid, ids in p["riwayat_list"].items():
-        c.append(f"RPUSH {key_riwayat_list(lid)} " + " ".join(str(i) for i in ids))
-    for s, m in p["status_index"].items():
-        if m:
-            c.append(f"ZADD {key_status_idx(s)} " + " ".join(f"{sc} {i}" for i, sc in m.items()))
-    c.append(f"HSET {KEY_STATS} " + " ".join(f"{s} {n}" for s, n in p["stats"].items()))
-    if p["prioritas"]:
-        c.append(f"ZADD {KEY_PRIORITAS} " + " ".join(f"{sc} {i}" for i, sc in p["prioritas"].items()))
-    c.append(f"GEOADD {KEY_GEO} " + " ".join(f"{g['lng']:.7f} {g['lat']:.7f} {g['id']}" for g in p["geo"]))
-    c.append(f"SET {KEY_SEQ_RIWAYAT} {p['seq_riwayat']}")
-    return c
-
-
-def main():
-    ex = json.loads((OUT_DIR / "mysql_extract.json").read_text(encoding="utf-8"))
-    p = build_payload(ex)
-    (OUT_DIR / "redis_payload.json").write_text(json.dumps(p, indent=2, ensure_ascii=False), encoding="utf-8")
-    cmds = to_redis_commands(p)
-    (OUT_DIR / "migrasi_data.redis").write_text("\n".join(cmds) + "\n", encoding="utf-8")
-    s = p["summary"]
-    print(f"[transform] HASH laporan:{{id}}         : {s['laporan']}")
-    print(f"[transform] HASH hasil_deteksi:{{id}}   : {s['hasil_deteksi']}")
-    print(f"[transform] HASH pengguna:{{id}}        : {s['pengguna']}")
-    print(f"[transform] HASH riwayat:{{id}}         : {s['riwayat']} (LIST riwayat:laporan:*: {s['riwayat_list']})")
-    print(f"[transform] ZSET idx:status:*:laporan  : {p['stats']}")
-    print(f"[transform] ZSET idx:prioritas:laporan : {s['prioritas']}")
-    print(f"[transform] GEO  idx:lokasi:laporan    : {s['geo']}")
-    print(f"[transform] seq:riwayat                : {p['seq_riwayat']}")
-    print(f"[transform] laporan tanpa deteksi AI   : {s['tanpa_deteksi']}")
-    print(f"[transform] dilewati                   : {s['skipped']}")
-    print(f"[transform] file                       : redis_payload.json, migrasi_data.redis ({len(cmds)} perintah)")
-
-
-if __name__ == "__main__":
-    main()

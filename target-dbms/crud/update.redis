@@ -1,0 +1,30 @@
+# UPDATE 1 - Menunggu -> Diproses (satu transaksi agar Hash, indeks, counter berubah bersamaan)
+INCR seq:riwayat
+
+MULTI
+HSET laporan:100 status Diproses
+ZREM idx:status:menunggu:laporan 100
+ZADD idx:status:diproses:laporan 1795508100 100
+HINCRBY stats:status menunggu -1
+HINCRBY stats:status diproses 1
+HSET riwayat:23 id_riwayat 23 id_laporan 100 id_pengguna 4 waktu_perubahan "2026-11-24 09:00:00" status_baru Diproses catatan "Laporan diverifikasi petugas"
+RPUSH riwayat:laporan:100 23
+EXEC
+
+
+# UPDATE 2 - Diproses -> Selesai (keluar dari antrean prioritas)
+INCR seq:riwayat
+
+MULTI
+HSET laporan:100 status Selesai
+ZREM idx:status:diproses:laporan 100
+ZADD idx:status:selesai:laporan 1795508100 100
+HINCRBY stats:status diproses -1
+HINCRBY stats:status selesai 1
+ZREM idx:prioritas:laporan 100
+HSET riwayat:24 id_riwayat 24 id_laporan 100 id_pengguna 4 waktu_perubahan "2026-11-25 10:30:00" status_baru Selesai catatan "Perbaikan selesai"
+RPUSH riwayat:laporan:100 24
+EXEC
+
+ZSCORE idx:prioritas:laporan 100
+

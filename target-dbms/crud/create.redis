@@ -1,0 +1,20 @@
+# CREATE 
+HSET laporan:100 id_laporan 100 id_pengguna 1 tingkat_keparahan Tinggi foto jalan_rusak_uji.jpg latitude -7.4720000 longitude 112.4410000 alamat "Jl. Pahlawan" waktu_lapor "2026-11-24 08:15:00" status Menunggu
+
+HSET hasil_deteksi:100 id_deteksi 100 id_laporan 100 jenis_kerusakan "Lubang Jalan" kotak_batas '{"x": 120, "y": 80, "width": 200, "height": 150}' tingkat_keyakinan 92.00
+
+ZADD idx:status:menunggu:laporan 1795508100 100
+
+HINCRBY stats:status menunggu 1
+
+ZADD idx:prioritas:laporan 276 100
+
+GEOADD idx:lokasi:laporan 112.4410000 -7.4720000 100
+
+INCR seq:riwayat
+
+HSET riwayat:22 id_riwayat 22 id_laporan 100 id_pengguna 1 waktu_perubahan "2026-11-24 08:15:00" status_baru Menunggu catatan "Laporan dibuat oleh pelapor"
+
+RPUSH riwayat:laporan:100 22
+
+

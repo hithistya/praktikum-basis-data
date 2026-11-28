@@ -1,0 +1,14 @@
+# DELETE 
+MULTI
+DEL laporan:100 hasil_deteksi:100 riwayat:laporan:100 riwayat:22 riwayat:23 riwayat:24
+ZREM idx:status:selesai:laporan 100
+HINCRBY stats:status selesai -1
+ZREM idx:prioritas:laporan 100
+ZREM idx:lokasi:laporan 100
+SET seq:riwayat 21
+EXEC
+
+EXISTS laporan:100
+
+HGETALL stats:status
+
